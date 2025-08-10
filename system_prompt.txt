@@ -1,0 +1,6 @@
+pip install -r requirements.txt
+export TELEGRAM_BOT_TOKEN=123:abc-your-botfather-token
+export OPENAI_API_KEY=sk-your-openai-key
+python dev_runner.py   # hot reload
+# or
+python bot.py          # stable run
