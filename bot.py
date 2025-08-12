@@ -7,9 +7,10 @@ from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 import asyncio
-import json
 import signal
-import requests
+
+# --- Gemini SDK ---
+import google.generativeai as genai
 
 # ---------- Config & Logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -19,7 +20,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("personal-gpt-bot")
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")   # or gemini-1.5-pro
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "15"))
 PROMPT_FILE = os.getenv("PROMPT_FILE", "system_prompt.txt")
 
@@ -29,27 +30,33 @@ def load_system_prompt() -> str:
             return f.read().strip()
     except FileNotFoundError:
         logger.warning("%s not found. Using fallback prompt.", PROMPT_FILE)
-        return (
-            "You are a friendly, helpful assistant who speaks casually, with memes and light humor when appropriate. "
-            "Be concise unless asked for depth. Avoid purple prose."
-        )
+        return ("You are a friendly, helpful assistant who speaks casually, "
+                "with light humor when appropriate. Be concise unless asked for depth.")
 
 SYSTEM_PROMPT = load_system_prompt()
 history: Dict[int, List[Dict[str, str]]] = {}
 
-# ---------- OpenAI ----------
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+# ---------- Gemini init ----------
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise RuntimeError("GOOGLE_API_KEY not set")
+genai.configure(api_key=GOOGLE_API_KEY)
+_gem = genai.GenerativeModel(MODEL)
 
-def call_openai(messages: List[Dict[str, str]], model: str = MODEL, temperature: float = 0.6) -> str:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not set")
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": temperature}
-    resp = requests.post(OPENAI_URL, headers=headers, data=json.dumps(payload), timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"].strip()
+def llm_reply(messages: List[Dict[str, str]], temperature: float = 0.6) -> str:
+    """Generate a reply using Gemini. Keeps function name stable for the app."""
+    # Flatten chat to a single prompt (simple + robust)
+    prompt = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
+    try:
+        resp = _gem.generate_content(
+            prompt,
+            generation_config={"temperature": temperature},
+        )
+        text = getattr(resp, "text", "") or ""
+        return text.strip() if text else "Empty response."
+    except Exception as e:
+        logger.exception("Gemini API error: %s", e)
+        return "Brain server hiccuped. Try again in a sec."
 
 # ---------- Utils ----------
 async def send_typing(update: Update):
@@ -67,7 +74,7 @@ def build_messages(user_id: int, user_text: str) -> List[Dict[str, str]]:
 
 # ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Yo! I'm your personal GPT bruh 🤖\nSend me a message to chat.")
+    await update.message.reply_text("Yo! I'm your personal GPT (Gemini) 🤖\nSend me a message to chat.")
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -95,7 +102,7 @@ async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("OK")
 
-# ---------- Message handler ----------
+# ---------- Message Handler ----------
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -105,18 +112,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(send_typing(update))
     msgs = build_messages(user_id, text)
 
-    try:
-        reply = await asyncio.to_thread(call_openai, msgs)
-    except Exception as e:
-        logger.exception("OpenAI error: %s", e)
-        reply = "Brain server hiccuped. Try again in a sec."
-
+    reply = await asyncio.to_thread(llm_reply, msgs)
     history.setdefault(user_id, []).extend(
         [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
     )
     await update.message.reply_text(reply, disable_web_page_preview=True)
 
-# ---------- Graceful shutdown ----------
+# ---------- Graceful Shutdown ----------
 shutdown_requested = asyncio.Event()
 
 async def _graceful_shutdown(app: Application):
@@ -146,7 +148,7 @@ async def run_bot():
         try:
             loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(_graceful_shutdown(app)))
         except NotImplementedError:
-            pass
+            pass  # Windows
 
     logger.info("Bot is running… (log %s)", LOG_LEVEL)
     await app.initialize()
